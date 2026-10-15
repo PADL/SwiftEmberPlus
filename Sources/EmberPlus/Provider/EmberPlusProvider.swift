@@ -14,7 +14,14 @@
 // limitations under the License.
 //
 
+#if canImport(IORing)
+import Glibc
+import IORing
+import IORingUtils
+import SocketAddress
+#else
 import FlyingSocks
+#endif
 import Foundation
 import Logging
 
@@ -38,36 +45,17 @@ public final class EmberPlusProvider<Source: EmberPlusTreeSource>: Sendable {
   }
 
   /// Listens on all interfaces until cancelled.
+  ///
+  /// On Linux a write to a consumer that has gone raises SIGPIPE, as io_uring writes cannot
+  /// ask for MSG_NOSIGNAL, so the program must ignore or handle it.
   public func run() async throws {
-    let pool = SocketPool.make()
-    try await pool.prepare()
-    let socket = try Socket(domain: AF_INET6)
-    try socket.setValue(true, for: .localAddressReuse)
-    #if canImport(Darwin)
-    try socket.setValue(true, for: .noSIGPIPE)
-    #endif
-    try socket.bind(to: .inet6(port: port))
-    try socket.listen()
+    let listener = try EmberPlusListener(port: port)
     logger.info("Ember+ provider listening on port \(port)")
-    try await serve(listener: AsyncSocket(socket: socket, pool: pool), pool: pool)
+    try await serve(listener: listener)
   }
 
-  func serve(listener: AsyncSocket, pool: some AsyncSocketPool) async throws {
-    defer { try? listener.close() }
-    try await withThrowingTaskGroup(of: Void.self) { group in
-      group.addTask { try await pool.run() }
-      group.addTask {
-        try await withThrowingDiscardingTaskGroup { sessions in
-          for try await socket in listener.sockets {
-            sessions.addTask {
-              await self.serve(EmberPlusSocketTransport(socket))
-            }
-          }
-        }
-      }
-      try await group.next()
-      group.cancelAll()
-    }
+  func serve(listener: EmberPlusListener) async throws {
+    try await listener.run { await self.serve($0) }
   }
 
   /// Serves one consumer over any transport until it disconnects.
@@ -76,6 +64,131 @@ public final class EmberPlusProvider<Source: EmberPlusTreeSource>: Sendable {
     logger.debug("\(session) connected")
     await session.run(source: source)
     logger.debug("\(session) disconnected")
+  }
+}
+
+#if canImport(IORing)
+
+/// A listening IPv6 socket (taking IPv4 too, unless the host says otherwise), whose
+/// consumers io_uring accepts, reads and writes.
+struct EmberPlusListener: Sendable {
+  private let socket: Socket
+  /// The port bound, which is the one asked for unless that was 0.
+  let port: UInt16
+
+  init(port: UInt16, loopback: Bool = false, ring: IORing = .shared) throws {
+    let socket = try Socket(ring: ring, domain: sa_family_t(AF_INET6), type: SOCK_STREAM)
+    try socket.setReuseAddr()
+    // inherited by the sockets accepted: the meter stream is small messages
+    try socket.setTcpNoDelay()
+    var address = sockaddr_in6()
+    address.sin6_family = sa_family_t(AF_INET6)
+    address.sin6_port = port.bigEndian
+    if loopback { address.sin6_addr = in6addr_loopback }
+    try socket.bind(to: address)
+    try socket.listen()
+    self.socket = socket
+    self.port = try socket.localAddress.port
+  }
+
+  /// Accepts consumers, serving each in a task of its own, until cancelled.
+  func run(_ serve: @escaping @Sendable (EmberPlusIORingTransport) async -> ()) async throws {
+    try await withThrowingDiscardingTaskGroup { sessions in
+      // a multishot accept, rearmed should the kernel end it
+      while !Task.isCancelled {
+        do {
+          for try await socket in try await socket.accept() {
+            sessions.addTask { await serve(EmberPlusIORingTransport(socket)) }
+          }
+        } catch where Task.isCancelled {
+          break
+        }
+      }
+    }
+  }
+}
+
+struct EmberPlusIORingTransport: EmberPlusTransport {
+  let socket: Socket
+  let peerDescription: String
+
+  init(_ socket: Socket) {
+    self.socket = socket
+    peerDescription = (try? socket.peerName) ?? "unknown"
+    // a consumer that vanishes without a FIN is noticed in two minutes, not hours
+    for (level, option, value) in Self.keepAliveOptions {
+      try? socket.setIntegerOption(level: level, option: option, to: value)
+    }
+  }
+
+  /// As SwiftOCA's `OcaTcpKeepAlive`: probes after 60 s idle, every 10 s, 6 times, with
+  /// unacknowledged writes failing after the same 120 s.
+  private static let keepAliveOptions: [(CInt, CInt, CInt)] = [
+    (SOL_SOCKET, SO_KEEPALIVE, 1),
+    (CInt(IPPROTO_TCP), TCP_KEEPIDLE, 60),
+    (CInt(IPPROTO_TCP), TCP_KEEPINTVL, 10),
+    (CInt(IPPROTO_TCP), TCP_KEEPCNT, 6),
+    (CInt(IPPROTO_TCP), TCP_USER_TIMEOUT, 120_000),
+  ]
+
+  func read() async throws -> [UInt8] {
+    // empty at the end of the stream
+    try await socket.read(count: 4096, awaitingAllRead: false)
+  }
+
+  func write(_ bytes: [UInt8]) async throws {
+    _ = try await socket.write(bytes, count: bytes.count, awaitingAllWritten: true)
+  }
+
+  /// Shuts the socket down rather than closing it, so a read in flight ends with the
+  /// stream; the descriptor is closed when the last reference goes.
+  func close() {
+    try? socket.shutdown()
+  }
+}
+
+#else
+
+/// A listening IPv6 socket (taking IPv4 too, unless the host says otherwise), whose
+/// consumers FlyingSocks accepts, reads and writes.
+struct EmberPlusListener: Sendable {
+  private let socket: Socket
+  /// The port bound, which is the one asked for unless that was 0.
+  let port: UInt16
+
+  init(port: UInt16, loopback: Bool = false) throws {
+    let socket = try Socket(domain: AF_INET6)
+    try socket.setValue(true, for: .localAddressReuse)
+    #if canImport(Darwin)
+    try socket.setValue(true, for: .noSIGPIPE)
+    #endif
+    try socket.bind(to: loopback ? .loopback(port: port) : .inet6(port: port))
+    try socket.listen()
+    guard case let .ip6(_, port) = try socket.sockname() else {
+      throw SocketError.unsupportedAddress
+    }
+    self.socket = socket
+    self.port = port
+  }
+
+  /// Accepts consumers, serving each in a task of its own, until cancelled.
+  func run(_ serve: @escaping @Sendable (EmberPlusSocketTransport) async -> ()) async throws {
+    let pool = SocketPool.make()
+    try await pool.prepare()
+    let listener = try AsyncSocket(socket: socket, pool: pool)
+    defer { try? listener.close() }
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask { try await pool.run() }
+      group.addTask {
+        try await withThrowingDiscardingTaskGroup { sessions in
+          for try await socket in listener.sockets {
+            sessions.addTask { await serve(EmberPlusSocketTransport(socket)) }
+          }
+        }
+      }
+      try await group.next()
+      group.cancelAll()
+    }
   }
 }
 
@@ -109,3 +222,5 @@ struct EmberPlusSocketTransport: EmberPlusTransport {
     try? socket.close()
   }
 }
+
+#endif

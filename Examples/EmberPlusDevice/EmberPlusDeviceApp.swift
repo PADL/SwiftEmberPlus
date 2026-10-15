@@ -25,6 +25,9 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+#if canImport(IORing)
+import IORing
+#endif
 
 /// SwiftOCA's OCADevice example, with an Ember+ provider in front of it: the same objects
 /// (a block of boolean actuators in a matrix, a gain whose changes a counter notifier
@@ -46,6 +49,10 @@ enum EmberPlusDeviceApp {
   }
 
   static func main() async throws {
+    #if canImport(IORing)
+    // as OCADevice: the executor's threads never exit, and every task runs there
+    try IORing.installExecutor(policy: .global)
+    #endif
     var options = Options()
     var arguments = CommandLine.arguments.dropFirst()
     while let argument = arguments.popFirst() {

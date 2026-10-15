@@ -15,7 +15,9 @@
 //
 
 @testable import EmberPlus
-import FlyingSocks
+#if canImport(Glibc)
+import Glibc
+#endif
 import Synchronization
 import XCTest
 
@@ -173,6 +175,14 @@ final class TestTreeSource: EmberPlusTreeSource {
 }
 
 final class EmberPlusProviderTests: XCTestCase {
+  override class func setUp() {
+    super.setUp()
+    #if canImport(Glibc)
+    // as a program serving Ember+ on Linux must: a write to a consumer that has gone raises it
+    signal(SIGPIPE, SIG_IGN)
+    #endif
+  }
+
   func testRequestsResolveNestedPaths() {
     let root = GlowRoot.elements([
       .node(GlowNode(.number(1), children: [
@@ -253,28 +263,22 @@ final class EmberPlusProviderTests: XCTestCase {
   func testOverTCP() async throws {
     let source = TestTreeSource()
     let provider = EmberPlusProvider(source: source)
-    let pool = SocketPool.make()
-    try await pool.prepare()
-    let socket = try Socket(domain: AF_INET6)
-    try socket.bind(to: .loopback(port: 0))
-    try socket.listen()
-    guard case let .ip6(_, port) = try socket.sockname() else { return XCTFail() }
-    let serving = Task {
-      try await provider.serve(listener: AsyncSocket(socket: socket, pool: pool), pool: pool)
-    }
+    let listener = try EmberPlusListener(port: 0, loopback: true)
+    let serving = Task { try await provider.serve(listener: listener) }
     defer { serving.cancel() }
 
-    let client = try await AsyncSocket.connected(to: .loopback(port: port))
-    defer { try? client.close() }
+    let client = try await TestTCPClient(port: listener.port)
+    defer { client.close() }
     let request = S101Message.packets(for: GlowRoot.elements([
       .command(GlowCommand(.getDirectory)),
     ]).encoded())[0]
-    try await client.write(Data(S101.frame(request.encoded)))
+    try await client.write(S101.frame(request.encoded))
 
     var deframer = S101.Deframer()
     var reassembler = S101Message.Reassembler()
     while true {
-      let bytes = try await client.read(atMost: 4096)
+      let bytes = try await client.read()
+      guard !bytes.isEmpty else { return XCTFail("the provider closed the connection") }
       for case let .message(bytes, _) in deframer.receive(bytes) {
         guard case let .ember(packet) = try S101Message(decoding: bytes).command,
               case let .message(payload)? = reassembler.receive(packet) else { continue }
@@ -282,8 +286,78 @@ final class EmberPlusProviderTests: XCTestCase {
           try GlowRoot(decoding: payload),
           .elements([.node(GlowNode(.path([1]), contents: GlowNodeContents(identifier: "device")))])
         )
+        client.close()
+        // the session ends with the connection
+        for _ in 0..<500 where !source.sessions.withLock({ $0.isEmpty }) {
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(source.sessions.withLock { $0.isEmpty })
         return
       }
+    }
+  }
+
+  /// The provider's end of a loopback connection to `client`, accepted by its own listener.
+  private func accept(
+    _ body: @Sendable (_ transport: any EmberPlusTransport, _ client: TestTCPClient) async throws -> ()
+  ) async throws {
+    let listener = try EmberPlusListener(port: 0, loopback: true)
+    let (accepted, continuation) = AsyncStream.makeStream(of: (any EmberPlusTransport).self)
+    let listening = Task { try await listener.run { continuation.yield($0) } }
+    defer { listening.cancel() }
+    let client = try await TestTCPClient(port: listener.port)
+    defer { client.close() }
+    var iterator = accepted.makeAsyncIterator()
+    guard let transport = await iterator.next() else { return XCTFail("nothing accepted") }
+    try await body(transport, client)
+  }
+
+  func testTransportReadsEmptyAtEndOfStream() async throws {
+    try await accept { transport, client in
+      XCTAssertFalse(transport.peerDescription.isEmpty)
+      XCTAssertNotEqual(transport.peerDescription, "unknown")
+      try await client.write([1, 2, 3])
+      var received = [UInt8]()
+      while received.count < 3 {
+        let bytes = try await transport.read()
+        XCTAssertFalse(bytes.isEmpty)
+        received += bytes
+      }
+      XCTAssertEqual(received, [1, 2, 3])
+      client.close()
+      let bytes = try await transport.read()
+      XCTAssertEqual(bytes, [])
+    }
+  }
+
+  func testTransportCloseEndsPendingRead() async throws {
+    try await accept { transport, client in
+      let reading = Task { try await transport.read() }
+      // give the read time to be in flight
+      try await Task.sleep(for: .milliseconds(100))
+      transport.close()
+      let bytes = try await reading.value
+      XCTAssertEqual(bytes, [])
+      // and the consumer sees the end of the stream
+      let clientBytes = try await client.read()
+      XCTAssertEqual(clientBytes, [])
+    }
+  }
+
+  func testTransportWriteToGoneConsumerThrows() async throws {
+    try await accept { transport, client in
+      client.close()
+      // the first writes may go out before the peer's reset comes back
+      let bytes = [UInt8](repeating: 0, count: 4096)
+      for _ in 0..<100 {
+        do {
+          try await transport.write(bytes)
+        } catch {
+          return
+        }
+        try await Task.sleep(for: .milliseconds(10))
+      }
+      XCTFail("writes to a closed connection kept succeeding")
     }
   }
 }
