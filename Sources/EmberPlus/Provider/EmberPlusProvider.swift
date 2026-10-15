@@ -46,9 +46,6 @@ public final class EmberPlusProvider<Source: EmberPlusTreeSource>: Sendable {
   }
 
   /// Listens on all interfaces until cancelled.
-  ///
-  /// On Linux a write to a consumer that has gone raises SIGPIPE, as io_uring writes cannot
-  /// ask for MSG_NOSIGNAL, so the program must ignore or handle it.
   public func run() async throws {
     let listener = try EmberPlusListener(port: port)
     logger.info("Ember+ provider listening on port \(port)")

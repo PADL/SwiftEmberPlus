@@ -20,7 +20,7 @@ var ExecutorTargetDependencies: [Target.Dependency] = []
 
 #if os(Linux)
 PlatformPackageDependencies += [
-  .package(url: "https://github.com/PADL/IORingSwift", from: "2.2.0"),
+  .package(url: "https://github.com/PADL/IORingSwift", from: "2.3.0"),
   .package(url: "https://github.com/PADL/SocketAddress", from: "0.5.2"),
 ]
 

@@ -15,9 +15,6 @@
 //
 
 @testable import EmberPlus
-#if canImport(Glibc)
-import Glibc
-#endif
 import Synchronization
 import XCTest
 
@@ -175,14 +172,6 @@ final class TestTreeSource: EmberPlusTreeSource {
 }
 
 final class EmberPlusProviderTests: XCTestCase {
-  override class func setUp() {
-    super.setUp()
-    #if canImport(Glibc)
-    // as a program serving Ember+ on Linux must: a write to a consumer that has gone raises it
-    signal(SIGPIPE, SIG_IGN)
-    #endif
-  }
-
   func testRequestsResolveNestedPaths() {
     let root = GlowRoot.elements([
       .node(GlowNode(.number(1), children: [

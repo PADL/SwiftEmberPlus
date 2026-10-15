@@ -71,7 +71,6 @@ enum EmberPlusDeviceApp {
       handler.logLevel = options.debug ? .debug : .info
       return handler
     }
-    signal(SIGPIPE, SIG_IGN)
 
     let objects = try await makeObjects()
     let ocp1Endpoint = try await OcaTCPDeviceEndpoint(address: anyAddress(port: options.ocaPort))
