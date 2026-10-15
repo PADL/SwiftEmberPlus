@@ -24,6 +24,7 @@ import FlyingSocks
 #endif
 import Foundation
 import Logging
+import Synchronization
 
 /// An Ember+ provider listening on TCP, serving one tree source to any number of consumers.
 public final class EmberPlusProvider<Source: EmberPlusTreeSource>: Sendable {
@@ -192,9 +193,20 @@ struct EmberPlusListener: Sendable {
   }
 }
 
-struct EmberPlusSocketTransport: EmberPlusTransport {
+/// A consumer's connection. Closing it shuts the socket down rather than closing it,
+/// because closing a socket does not wake a read already waiting on it, where shutting
+/// it down makes it readable at its end; the read that sees the end closes it. The socket
+/// is closed once, so a descriptor the system has since reused is never shut down.
+final class EmberPlusSocketTransport: EmberPlusTransport {
+  private enum State {
+    case open
+    case shutDown
+    case closed
+  }
+
   let socket: AsyncSocket
   let peerDescription: String
+  private let state = Mutex(State.open)
 
   init(_ socket: AsyncSocket) {
     self.socket = socket
@@ -207,10 +219,21 @@ struct EmberPlusSocketTransport: EmberPlusTransport {
   }
 
   func read() async throws -> [UInt8] {
+    guard state.withLock({ $0 }) != .closed else { return [] }
     do {
-      return try await socket.read(atMost: 4096)
+      let bytes = try await socket.read(atMost: 4096)
+      if bytes.isEmpty { closeSocket() }
+      return bytes
     } catch SocketError.disconnected {
+      closeSocket()
       return []
+    } catch {
+      // a shut down socket may fail its read rather than end it
+      guard state.withLock({ $0 }) == .open else {
+        closeSocket()
+        return []
+      }
+      throw error
     }
   }
 
@@ -219,7 +242,23 @@ struct EmberPlusSocketTransport: EmberPlusTransport {
   }
 
   func close() {
-    try? socket.close()
+    state.withLock { state in
+      guard state == .open else { return }
+      _ = shutdown(socket.socket.file.rawValue, Int32(SHUT_RDWR))
+      state = .shutDown
+    }
+  }
+
+  private func closeSocket() {
+    state.withLock { state in
+      guard state != .closed else { return }
+      try? socket.close()
+      state = .closed
+    }
+  }
+
+  deinit {
+    closeSocket()
   }
 }
 
