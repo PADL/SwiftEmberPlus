@@ -119,16 +119,19 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   private func members(of object: SwiftOCADevice.OcaRoot) async -> [(UInt32, SwiftOCADevice.OcaRoot)] {
     var members = [(UInt32, SwiftOCADevice.OcaRoot)]()
     var seen = Set<UInt32>()
+    // an object is a member once: the root block may list a manager among its members
+    var listed = Set<OcaONo>()
     if object === (await device.rootBlock) {
       for manager in await device.managers {
         let number = UInt32(manager.objectNumber)
         if EmberPlusOcaNumbering.isManager(number), seen.insert(number).inserted {
+          listed.insert(manager.objectNumber)
           members.append((number, manager))
         }
       }
     }
     if let block = object as? any OcaBlockContainer {
-      for member in block.actionObjects {
+      for member in block.actionObjects where listed.insert(member.objectNumber).inserted {
         guard let number = EmberPlusOcaNumbering.candidates(forMember: member.objectNumber)
           .first(where: { !seen.contains($0) })
         else {

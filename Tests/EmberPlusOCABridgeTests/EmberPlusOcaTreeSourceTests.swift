@@ -237,6 +237,11 @@ final class EmberPlusOcaTreeSourceTests: XCTestCase {
     XCTAssertEqual(identifiers["Channel"], blockPath)
     // the device manager is object 1
     XCTAssertTrue(identifiers.values.contains([1, 1]))
+    // a manager the root block also lists among its members is presented once, as a
+    // manager, so no identifier needs a suffix to tell it from another
+    let roles = children.compactMap(\.nodeContents?.identifier)
+    XCTAssertEqual(roles.count, Set(roles).count)
+    XCTAssertFalse(roles.contains { $0.contains("Manager_") }, "\(roles)")
   }
 
   func testBlockMembers() async throws {
