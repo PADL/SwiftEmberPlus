@@ -50,22 +50,54 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     var setting = Set<GlowPath>()
     /// The stream parameters the session has subscribed to.
     var streams = Set<GlowPath>()
-    /// The crosspoints of the matrices the session has the directories of, by their
-    /// actuators' object numbers: the matrix's path, and the crosspoint's target.
-    var crosspoints = [OcaONo: (matrix: GlowPath, target: Int)]()
+    /// The matrices the session has the directories of, by path.
+    var matrices = [GlowPath: MatrixKey]()
+    /// The label nodes the session has the directories of, by path.
+    var labelNodes = [GlowPath: (matrix: MatrixKey, side: LabelSide)]()
     /// The objects whose property changes the device sends the session's controller.
     var hearing = Set<OcaONo>()
     /// The matrices the session is changing the connections of, whose replies tell it of
     /// the change.
     var connecting = Set<GlowPath>()
     /// The sources the session was last told each matrix target has.
-    var toldConnections = [GlowPath: [Int: [UInt32]]]()
+    var toldConnections = [GlowPath: [Int32: [Int32]]]()
+
+    /// Whether anything the session has the directory of hears of the object.
+    func hears(_ objectNumber: OcaONo) -> Bool {
+      subscribed[objectNumber] != nil
+        || matrices.values.contains { $0.emitters.contains(objectNumber) }
+        || labelNodes.values.contains { $0.matrix.emitters.contains(objectNumber) }
+    }
   }
+
+  /// A matrix as a session knows it: its object, its number there, and the objects whose
+  /// property changes may change it.
+  private struct MatrixKey {
+    let objectNumber: OcaONo
+    let number: UInt32?
+    let emitters: Set<OcaONo>
+  }
+
+  /// A label node under a matrix's label base (Ember+ 1.1: targets 1, sources 2).
+  private enum LabelSide: UInt32 {
+    case targets = 1
+    case sources = 2
+  }
+
+  /// The number of a matrix's label base under the matrix.
+  nonisolated static let labelsNumber: UInt32 = 1
+
+  private typealias Presenter = any EmberPlusOcaMatrixRepresentable
 
   private enum Element {
     case object(SwiftOCADevice.OcaRoot)
     case parameter(SwiftOCADevice.OcaRoot, EmberPlusOcaParameter)
     case function(SwiftOCADevice.OcaRoot, EmberPlusOcaFunction)
+    /// A matrix numbered under its object's node.
+    case matrix(Presenter, EmberPlusOcaMatrix)
+    case labels(Presenter, EmberPlusOcaMatrix)
+    case labelNode(Presenter, EmberPlusOcaMatrix, LabelSide)
+    case label(Presenter, EmberPlusOcaMatrix, LabelSide, Int32)
   }
 
   private let device: OcaDevice
@@ -171,20 +203,50 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   private func resolve(_ path: GlowPath) async -> Element? {
     guard path.first == Self.rootNumber, let root = await device.rootBlock else { return nil }
     var object: SwiftOCADevice.OcaRoot = root
-    for (index, number) in path.dropFirst().enumerated() {
-      if let member = await members(of: object).first(where: { $0.0 == number })?.1 {
-        object = member
-        continue
+    var arcs = path.dropFirst()
+    while let number = arcs.first {
+      guard let member = await members(of: object).first(where: { $0.0 == number })?.1 else {
+        return resolve(Array(arcs), below: object)
       }
-      // a parameter or function ends the path
-      guard index == path.count - 2 else { return nil }
-      let presentation = presentation(of: object)
-      if let parameter = presentation.parameter(number) { return .parameter(object, parameter) }
-      if let function = presentation.function(number) { return .function(object, function) }
-      return nil
+      object = member
+      arcs = arcs.dropFirst()
     }
     return .object(object)
   }
+
+  /// What is below an object's node that is not a member: a parameter or function, or a
+  /// matrix of the object's and its labels.
+  private func resolve(_ arcs: [UInt32], below object: SwiftOCADevice.OcaRoot) -> Element? {
+    if arcs.count == 1 {
+      let presentation = presentation(of: object)
+      if let parameter = presentation.parameter(arcs[0]) { return .parameter(object, parameter) }
+      if let function = presentation.function(arcs[0]) { return .function(object, function) }
+    }
+    guard let presenter = object as? Presenter else { return nil }
+    let matrices = presenter.emberPlusMatrices
+    var rest = arcs[...]
+    let matrix: EmberPlusOcaMatrix
+    if Self.isMatrixNumber(arcs[0]), let numbered = matrices.first(where: { $0.number == arcs[0] }) {
+      matrix = numbered
+      rest = rest.dropFirst()
+      if rest.isEmpty { return .matrix(presenter, matrix) }
+    } else if let own = matrices.first(where: { $0.number == nil }) {
+      matrix = own
+    } else {
+      return nil
+    }
+    guard matrix.labels != nil, rest.first == Self.labelsNumber else { return nil }
+    rest = rest.dropFirst()
+    guard let side = rest.first else { return .labels(presenter, matrix) }
+    guard let side = LabelSide(rawValue: side) else { return nil }
+    rest = rest.dropFirst()
+    guard let signal = rest.first else { return .labelNode(presenter, matrix, side) }
+    guard rest.count == 1, let number = Int32(exactly: signal) else { return nil }
+    return .label(presenter, matrix, side, number)
+  }
+
+  /// A matrix's number under its object's node, below the numbers of its properties.
+  private static func isMatrixNumber(_ number: UInt32) -> Bool { (1..<0x100).contains(number) }
 
   // MARK: - Describing
 
@@ -444,17 +506,21 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       let presentation = presentation(of: object)
       let members = await members(of: object)
       let identifiers = identifiers(of: members, beside: presentation)
-      if let crosspoints = EmberPlusOcaCrosspoints(object) {
-        let identifier = await identifier(of: object, at: path)
-        children.append(await matrix(crosspoints, at: path, identifier: identifier, for: session.id))
+      if let presenter = object as? Presenter {
+        children += await matrices(for: presenter, at: path, session: session.id)
       }
       for (number, member) in members {
         let identifier = identifiers[number]!
-        if let crosspoints = EmberPlusOcaCrosspoints(member) {
-          children.append(.matrix(GlowMatrix(
-            .path(path + [number]),
-            contents: matrixContents(crosspoints, of: member, identifier: identifier)
-          )))
+        if let presenter = member as? Presenter,
+           let own = presenter.emberPlusMatrices.first(where: { $0.number == nil })
+        {
+          children.append(.matrix(GlowMatrix(.path(path + [number]), contents: matrixContents(
+            own,
+            for: presenter,
+            at: path + [number],
+            identifier: identifier,
+            signals: presenter.emberPlusSignals(for: own)
+          ))))
         } else {
           children.append(node(member, at: path + [number], identifier: identifier))
         }
@@ -477,14 +543,44 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       return [element]
     case let .function(_, function):
       return [describe(function, at: path)]
+    case let .matrix(presenter, matrix):
+      let identifier = matrixIdentifier(matrix, objectIdentifier: "")
+      var elements = [
+        await self.matrix(
+          matrix, for: presenter, at: path, identifier: identifier, session: session.id
+        ),
+      ]
+      if matrix.labels != nil {
+        elements.append(labelNode(at: path + [Self.labelsNumber], identifier: "labels"))
+      }
+      return elements
+    case .labels:
+      return [
+        labelNode(at: path + [LabelSide.targets.rawValue], identifier: "targets"),
+        labelNode(at: path + [LabelSide.sources.rawValue], identifier: "sources"),
+      ]
+    case let .labelNode(presenter, matrix, side):
+      let key = await listen(to: matrix, for: presenter, session: session.id)
+      sessions[session.id]?.labelNodes[path] = (key, side)
+      let labels = labels(side, in: matrix, for: presenter, at: path)
+      return labels.isEmpty ? [.node(GlowNode(.path(path)))] : labels
+    case let .label(presenter, matrix, side, _):
+      return labels(side, in: matrix, for: presenter, at: Array(path.dropLast()))
+        .filter { $0.address == .path(path) }
     case nil:
       return []
     }
   }
 
   private func set(_ value: GlowValue, at path: GlowPath, session: EmberPlusSession) async -> [GlowElement] {
-    guard let state = sessions[session.id],
-          case let .parameter(object, parameter)? = await resolve(path) else { return [] }
+    guard let state = sessions[session.id] else { return [] }
+    let resolved = await resolve(path)
+    // a label is read only, and is answered as it is
+    if case let .label(presenter, matrix, side, _)? = resolved {
+      return labels(side, in: matrix, for: presenter, at: Array(path.dropLast()))
+        .filter { $0.address == .path(path) }
+    }
+    guard case let .parameter(object, parameter)? = resolved else { return [] }
     sessions[session.id]?.setting.insert(path)
     defer { sessions[session.id]?.setting.remove(path) }
     let status = await write(value, to: parameter, of: object, as: state.controller)
@@ -539,6 +635,10 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       await subscribe(object, at: Array(path.dropLast()), session: session.id)
     case let .function(object, _):
       await subscribe(object, at: Array(path.dropLast()), session: session.id)
+    case .matrix, .labelNode:
+      _ = await directory(path, session: session)
+    case .labels, .label:
+      break
     case nil:
       break
     }
@@ -583,14 +683,13 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     for (objectNumber, objectPath) in state.subscribed where objectPath.starts(with: path) {
       sessions[session.id]?.subscribed[objectNumber] = nil
     }
-    for (objectNumber, crosspoint) in state.crosspoints where crosspoint.matrix.starts(with: path) {
-      sessions[session.id]?.crosspoints[objectNumber] = nil
-    }
+    sessions[session.id]?.matrices = state.matrices.filter { !$0.key.starts(with: path) }
+    sessions[session.id]?.labelNodes = state.labelNodes.filter { !$0.key.starts(with: path) }
+    sessions[session.id]?.toldConnections = state.toldConnections
+      .filter { !$0.key.starts(with: path) }
     // what the session no longer hears of in any way, the device stops sending it
     guard let remaining = sessions[session.id] else { return }
-    for objectNumber in remaining.hearing
-      where remaining.subscribed[objectNumber] == nil && remaining.crosspoints[objectNumber] == nil
-    {
+    for objectNumber in remaining.hearing where !remaining.hears(objectNumber) {
       await device.subscriptionManager?.removeSubscription(
         Self.subscription(objectNumber),
         for: state.controller
@@ -611,122 +710,316 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     return identifiers(of: members, beside: presentation(of: parent))[path.last!] ?? object.role
   }
 
+  /// A matrix's identifier: its own, else for the object's own matrix the object's.
+  private func matrixIdentifier(_ matrix: EmberPlusOcaMatrix, objectIdentifier: String) -> String {
+    matrix.identifier ?? matrix.number.map { "matrix\($0)" } ?? objectIdentifier
+  }
+
   private func matrixContents(
-    _ crosspoints: EmberPlusOcaCrosspoints,
-    of object: SwiftOCADevice.OcaRoot,
-    identifier: String
+    _ matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
+    at path: GlowPath,
+    identifier: String,
+    signals: EmberPlusOcaSignals
   ) -> GlowMatrixContents {
-    GlowMatrixContents(
+    let role = presenter.role
+    return GlowMatrixContents(
       identifier: identifier,
-      description: object.role.isEmpty ? nil : object.role,
-      type: .nToN,
-      addressingMode: .linear,
-      targetCount: Int32(crosspoints.targetCount),
-      sourceCount: Int32(crosspoints.sourceCount)
+      description: matrix.description ?? (matrix.number == nil && !role.isEmpty ? role : nil),
+      type: matrix.type,
+      addressingMode: matrix.addressingMode,
+      targetCount: Int32(clamping: signals.targets.count),
+      sourceCount: Int32(clamping: signals.sources.count),
+      labels: matrix.labels
+        .map { [GlowLabel(basePath: path + [Self.labelsNumber], description: $0)] }
     )
   }
 
+  /// An object's matrices, as its directory lists them: its own in full, the others by
+  /// their contents.
+  private func matrices(
+    for presenter: Presenter,
+    at path: GlowPath,
+    session id: UInt64
+  ) async -> [GlowElement] {
+    var elements = [GlowElement]()
+    for matrix in presenter.emberPlusMatrices {
+      guard let number = matrix.number else {
+        let objectIdentifier = await identifier(of: presenter, at: path)
+        let identifier = matrixIdentifier(matrix, objectIdentifier: objectIdentifier)
+        await elements.append(self.matrix(
+          matrix,
+          for: presenter,
+          at: path,
+          identifier: identifier,
+          session: id
+        ))
+        if matrix.labels != nil {
+          elements.append(labelNode(at: path + [Self.labelsNumber], identifier: "labels"))
+        }
+        continue
+      }
+      guard Self.isMatrixNumber(number) else {
+        logger
+          .warning(
+            "not presenting matrix \(number) of \(presenter.objectNumber): its number is not 1 to 255"
+          )
+        continue
+      }
+      elements.append(.matrix(GlowMatrix(.path(path + [number]), contents: matrixContents(
+        matrix,
+        for: presenter,
+        at: path + [number],
+        identifier: matrixIdentifier(matrix, objectIdentifier: ""),
+        signals: presenter.emberPlusSignals(for: matrix)
+      ))))
+    }
+    return elements
+  }
+
+  /// Has the session hear of the objects whose changes may change the matrix.
+  private func listen(
+    to matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
+    session id: UInt64
+  ) async -> MatrixKey {
+    let emitters = presenter.emberPlusEmitters(for: matrix)
+    for emitter in emitters {
+      await hear(emitter, session: id)
+    }
+    return MatrixKey(
+      objectNumber: presenter.objectNumber,
+      number: matrix.number,
+      emitters: Set(emitters)
+    )
+  }
+
+  /// The presenter and matrix a session's key names, as they now are.
+  private func matrix(for key: MatrixKey) async -> (Presenter, EmberPlusOcaMatrix)? {
+    guard let presenter = await device.objects[key.objectNumber] as? Presenter,
+          let matrix = presenter.emberPlusMatrices.first(where: { $0.number == key.number })
+    else { return nil }
+    return (presenter, matrix)
+  }
+
+  /// The matrix at a path: a numbered matrix, or an object's own.
+  private func matrix(at path: GlowPath) async -> (Presenter, EmberPlusOcaMatrix)? {
+    switch await resolve(path) {
+    case let .matrix(presenter, matrix):
+      return (presenter, matrix)
+    case let .object(object):
+      guard let presenter = object as? Presenter,
+            let own = presenter.emberPlusMatrices.first(where: { $0.number == nil })
+      else { return nil }
+      return (presenter, own)
+    default:
+      return nil
+    }
+  }
+
   /// A matrix with its signals and connections, as its GetDirectory answers, which has
-  /// the session hear of its crosspoints from then on.
+  /// the session hear of its changes from then on.
   private func matrix(
-    _ crosspoints: EmberPlusOcaCrosspoints,
+    _ matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
     at path: GlowPath,
     identifier: String,
-    for id: UInt64
+    session id: UInt64
   ) async -> GlowElement {
     guard let state = sessions[id] else { return .matrix(GlowMatrix(.path(path))) }
-    for (objectNumber, target) in crosspoints.targets {
-      sessions[id]?.crosspoints[objectNumber] = (path, target)
-      await hear(objectNumber, session: id)
+    let key = await listen(to: matrix, for: presenter, session: id)
+    sessions[id]?.matrices[path] = key
+    let signals = presenter.emberPlusSignals(for: matrix)
+    let current = await presenter.emberPlusConnections(for: matrix, controller: state.controller)
+    var told = [Int32: [Int32]]()
+    let connections = signals.targets.map { target in
+      let sources = current[target.number] ?? []
+      told[target.number] = sources
+      return GlowConnection(target: target.number, sources: Self.glowSources(sources))
     }
-    var connections = [GlowConnection]()
-    for target in 0..<crosspoints.targetCount {
-      let connection = await connection(of: crosspoints, target: target, as: state.controller)
-      sessions[id]?.toldConnections[path, default: [:]][target] = connection.sources
-      connections.append(connection)
-    }
+    sessions[id]?.toldConnections[path] = told
     return .matrix(GlowMatrix(
       .path(path),
-      contents: matrixContents(crosspoints, of: crosspoints.matrix, identifier: identifier),
-      targets: (0..<crosspoints.targetCount).map { Int32($0) },
-      sources: (0..<crosspoints.sourceCount).map { Int32($0) },
+      contents: matrixContents(
+        matrix,
+        for: presenter,
+        at: path,
+        identifier: identifier,
+        signals: signals
+      ),
+      targets: signals.targets.map(\.number),
+      sources: signals.sources.map(\.number),
       connections: connections
     ))
   }
 
-  /// The crosspoint's state, as its setting reads to the session's controller.
-  private func isConnected(
-    _ crosspoint: SwiftOCADevice.OcaRoot,
-    as controller: EmberPlusOcaController
-  ) async -> Bool {
-    guard let setting = presentation(of: crosspoint).parameters(for: EmberPlusOcaCrosspoints.setting)
-      .first else { return false }
-    return await read(setting, of: crosspoint, as: controller).0 == .boolean(true)
+  private static func glowSources(_ sources: [Int32]) -> [UInt32] {
+    sources.compactMap { UInt32(exactly: $0) }
   }
 
-  private func connection(
-    of crosspoints: EmberPlusOcaCrosspoints,
-    target: Int,
-    as controller: EmberPlusOcaController,
-    disposition: GlowConnectionDisposition? = nil
-  ) async -> GlowConnection {
-    var sources = [UInt32]()
-    for source in 0..<crosspoints.sourceCount {
-      if let crosspoint = crosspoints.crosspoint(target: target, source: source),
-         await isConnected(crosspoint, as: controller)
-      {
-        sources.append(UInt32(source))
-      }
+  private func labelNode(at path: GlowPath, identifier: String) -> GlowElement {
+    .node(GlowNode(.path(path), contents: GlowNodeContents(identifier: identifier, isOnline: true)))
+  }
+
+  /// A label node's parameters: one string per signal, numbered by the signal's number.
+  private func labels(
+    _ side: LabelSide,
+    in matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
+    at path: GlowPath
+  ) -> [GlowElement] {
+    let signals = presenter.emberPlusSignals(for: matrix)
+    let prefix = side == .targets ? "t" : "s"
+    return (side == .targets ? signals.targets : signals.sources).compactMap { signal in
+      guard let number = UInt32(exactly: signal.number) else { return nil }
+      return .parameter(GlowParameter(.path(path + [number]), contents: GlowParameterContents(
+        identifier: "\(prefix)\(signal.number)",
+        value: .string(signal.label ?? ""),
+        access: .read,
+        isOnline: true,
+        type: .string
+      )))
     }
-    return GlowConnection(target: Int32(target), sources: sources, disposition: disposition)
   }
 
-  /// Sets the crosspoints of each connection's target as it asks, through their own
-  /// setters. Each target's connection is answered as it now is: modified if every
-  /// crosspoint took, locked if any was refused.
+  /// Applies a consumer's connection request to the matrix as one change, through the
+  /// presenter as the session's controller. Each target asked about is answered as it now
+  /// is: modified, or locked with its sources unchanged if the request was refused.
   private func change(
     _ connections: [GlowConnection],
     of path: GlowPath,
     session: EmberPlusSession
   ) async -> [GlowElement] {
-    guard let state = sessions[session.id], case let .object(object)? = await resolve(path),
-          let crosspoints = EmberPlusOcaCrosspoints(object) else { return [] }
+    guard let state = sessions[session.id],
+          let (presenter, matrix) = await matrix(at: path) else { return [] }
+    let signals = presenter.emberPlusSignals(for: matrix)
+    let targets = Set(signals.targets.map(\.number))
+    let sources = Set(signals.sources.map(\.number))
+    var asked = [Int32]()
+    var changes = [EmberPlusOcaConnectionChange]()
+    for connection in connections where targets.contains(connection.target) {
+      if !asked.contains(connection.target) { asked.append(connection.target) }
+      changes.append(EmberPlusOcaConnectionChange(
+        target: connection.target,
+        sources: (connection.sources ?? []).compactMap { Int32(exactly: $0) }
+          .filter(sources.contains),
+        operation: connection.operation ?? .absolute
+      ))
+    }
+    guard !changes.isEmpty else { return [] }
     sessions[session.id]?.connecting.insert(path)
     defer { sessions[session.id]?.connecting.remove(path) }
-    var answers = [GlowConnection]()
-    for connection in connections {
-      let target = Int(connection.target)
-      guard (0..<crosspoints.targetCount).contains(target) else { continue }
-      let sources = Set((connection.sources ?? []).map { Int($0) })
-      var refused = false
-      for source in 0..<crosspoints.sourceCount {
-        guard let crosspoint = crosspoints.crosspoint(target: target, source: source),
-              let setting = presentation(of: crosspoint)
-              .parameters(for: EmberPlusOcaCrosspoints.setting).first else { continue }
-        let connect: Bool? = switch connection.operation ?? .absolute {
-        case .connect: sources.contains(source) ? true : nil
-        case .disconnect: sources.contains(source) ? false : nil
-        default: sources.contains(source)
-        }
-        guard let connect, await isConnected(crosspoint, as: state.controller) != connect else {
-          continue
-        }
-        let status = await write(.boolean(connect), to: setting, of: crosspoint, as: state.controller)
-        if status != .ok {
-          logger.debug("\(state.controller) setting crosspoint \(target):\(source) failed: \(status)")
-          refused = true
-        }
-      }
-      let answer = await self.connection(
-        of: crosspoints,
-        target: target,
-        as: state.controller,
-        disposition: refused ? .locked : .modified
+    var disposition = GlowConnectionDisposition.modified
+    var after = [Int32: [Int32]]()
+    do {
+      after = try await presenter.emberPlusConnect(
+        changes,
+        matrix: matrix,
+        controller: state.controller
       )
-      sessions[session.id]?.toldConnections[path, default: [:]][target] = answer.sources
-      answers.append(answer)
+    } catch {
+      logger.debug("\(state.controller) connecting \(changes) refused: \(error)")
+      disposition = .locked
     }
-    return answers.isEmpty ? [] : [.matrix(GlowMatrix(.path(path), connections: answers))]
+    if asked.contains(where: { after[$0] == nil }) {
+      let current = await presenter.emberPlusConnections(for: matrix, controller: state.controller)
+      after.merge(current) { answered, _ in answered }
+    }
+    let answers = asked.map { target in
+      let sources = after[target] ?? []
+      sessions[session.id]?.toldConnections[path, default: [:]][target] = sources
+      return GlowConnection(
+        target: target,
+        sources: Self.glowSources(sources),
+        disposition: disposition
+      )
+    }
+    return [.matrix(GlowMatrix(.path(path), connections: answers))]
+  }
+
+  /// A matrix's connections changed: the targets whose sources the session was told
+  /// otherwise, as tallies.
+  private func tally(
+    _ matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
+    at path: GlowPath,
+    session id: UInt64
+  ) async {
+    guard let state = sessions[id] else { return }
+    let current = await presenter.emberPlusConnections(for: matrix, controller: state.controller)
+    // a change of the session's own is answered by its reply
+    guard sessions[id]?.connecting.contains(path) != true else { return }
+    var changed = [GlowConnection]()
+    for target in presenter.emberPlusSignals(for: matrix).targets {
+      let sources = current[target.number] ?? []
+      guard sessions[id]?.toldConnections[path]?[target.number] != sources else { continue }
+      sessions[id]?.toldConnections[path, default: [:]][target.number] = sources
+      changed.append(GlowConnection(target: target.number, sources: Self.glowSources(sources)))
+    }
+    if !changed.isEmpty {
+      state.session.send(.elements([.matrix(GlowMatrix(.path(path), connections: changed))]))
+    }
+  }
+
+  /// A matrix's signals changed: the matrix again in full, and the label nodes the
+  /// session has.
+  private func resendSignals(
+    _ matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
+    at path: GlowPath,
+    session id: UInt64
+  ) async {
+    guard let state = sessions[id] else { return }
+    let identifier = await matrix.number == nil
+      ? matrixIdentifier(matrix, objectIdentifier: identifier(of: presenter, at: path))
+      : matrixIdentifier(matrix, objectIdentifier: "")
+    var elements = await [self.matrix(
+      matrix,
+      for: presenter,
+      at: path,
+      identifier: identifier,
+      session: id
+    )]
+    for (labelPath, label) in state.labelNodes
+      where label.matrix.objectNumber == presenter.objectNumber && label.matrix.number == matrix
+      .number
+    {
+      elements += labels(label.side, in: matrix, for: presenter, at: labelPath)
+    }
+    state.session.send(.elements(elements))
+  }
+
+  /// An object's property changed: whatever the session knows of the matrices that
+  /// listen to it.
+  private func matrixChanged(
+    _ property: OcaPropertyID,
+    for objectNumber: OcaONo,
+    session id: UInt64
+  ) async {
+    guard let state = sessions[id] else { return }
+    var resent = Set<GlowPath>()
+    for (path, key) in state.matrices where key.emitters.contains(objectNumber) {
+      guard let (presenter, matrix) = await matrix(for: key) else { continue }
+      if presenter.emberPlusSignalProperties.contains(property) {
+        resent.insert(path)
+        await resendSignals(matrix, for: presenter, at: path, session: id)
+      } else if presenter.emberPlusConnectionProperties.contains(property),
+                sessions[id]?.connecting.contains(path) != true
+      {
+        await tally(matrix, for: presenter, at: path, session: id)
+      }
+    }
+    // label nodes of a matrix the session has not the directory of
+    var labels = [GlowElement]()
+    for (path, label) in state.labelNodes where label.matrix.emitters.contains(objectNumber) {
+      guard let (presenter, matrix) = await matrix(for: label.matrix),
+            presenter.emberPlusSignalProperties.contains(property),
+            !resent.contains(where: { path.starts(with: $0) }) else { continue }
+      labels += self.labels(label.side, in: matrix, for: presenter, at: path)
+    }
+    if !labels.isEmpty {
+      state.session.send(.elements(labels))
+    }
   }
 
   // MARK: - Changes
@@ -735,21 +1028,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   private func changed(_ property: OcaPropertyID, of objectNumber: OcaONo, session id: UInt64) async {
     guard let state = sessions[id], let object = await device.objects[objectNumber] else { return }
 
-    // a crosspoint's actuator changed: its target's connection, as it now is
-    if property == EmberPlusOcaCrosspoints.setting,
-       let (matrixPath, target) = state.crosspoints[objectNumber],
-       !state.connecting.contains(matrixPath),
-       case let .object(matrix)? = await resolve(matrixPath),
-       let crosspoints = EmberPlusOcaCrosspoints(matrix)
-    {
-      let connection = await connection(of: crosspoints, target: target, as: state.controller)
-      if sessions[id]?.connecting.contains(matrixPath) != true,
-         sessions[id]?.toldConnections[matrixPath]?[target] != connection.sources
-      {
-        sessions[id]?.toldConnections[matrixPath, default: [:]][target] = connection.sources
-        state.session.send(.elements([.matrix(GlowMatrix(.path(matrixPath), connections: [connection]))]))
-      }
-    }
+    await matrixChanged(property, for: objectNumber, session: id)
 
     guard let path = state.subscribed[objectNumber] else { return }
 
