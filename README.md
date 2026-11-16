@@ -6,7 +6,8 @@ presents a [SwiftOCA](https://github.com/PADL/SwiftOCA) device through it.
 - **`EmberPlus`** knows nothing of OCA. It has S101 framing (both variants, with
   multi-packet messages and keep-alives), the Glow DTD 2.50 over BER (decoding indefinite
   lengths, using [swift-asn1](https://github.com/apple/swift-asn1)), and a TCP provider
-  that passes each consumer's requests to an `EmberPlusTreeSource`.
+  that passes each consumer's requests to an `EmberPlusTreeSource`. `EmberPlusConsumer` is
+  the other end, for tools and tests.
 - **`EmberPlusOCABridge`** is an `EmberPlusTreeSource` over a SwiftOCADevice device. Each
   Ember+ session is a controller of its own to the device, so locks and access checks
   apply as for any OCA controller, and nothing of the tree is kept: each request is
@@ -49,6 +50,16 @@ channel strip of a gain, a mute and a moving level meter. It prints what consume
 change, and serves OCP.1 and OCP.2 alongside, so a change can be made from either side.
 
     swift run EmberPlusDevice [--port 9000] [--oca-port 65000] [--no-meter] [--debug]
+
+`Examples/EmberPlusProbe` is a Glow consumer: it walks a provider's tree, reads a matrix
+with its labels and connections, sends connect, disconnect and absolute requests and
+prints each target's disposition, and prints the tallies that follow. A path is dotted
+numbers or identifiers separated by slashes; signals are numbers or labels.
+
+    swift run EmberPlusProbe <host>[:<port>] tree [<path>] [<depth>]
+    swift run EmberPlusProbe <host>[:<port>] matrix <path>
+    swift run EmberPlusProbe <host>[:<port>] connect|disconnect|absolute <path> <target> [<source>...]
+    swift run EmberPlusProbe <host>[:<port>] watch <path> [<seconds>]
 
 ## Compatibility
 

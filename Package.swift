@@ -82,6 +82,12 @@ let package = Package(
       ] + ExecutorTargetDependencies,
       path: "Examples/EmberPlusDevice"
     ),
+    // a Glow consumer for the command line: tree, matrix, connections and tallies
+    .executableTarget(
+      name: "EmberPlusProbe",
+      dependencies: ["EmberPlus"],
+      path: "Examples/EmberPlusProbe"
+    ),
     .testTarget(
       name: "EmberPlusTests",
       dependencies: [
