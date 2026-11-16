@@ -80,7 +80,7 @@ extension SwiftOCADevice.OcaMatrix: EmberPlusOcaMatrixRepresentable {
     guard let (targets, _) = crosspointSize else { return [:] }
     var connections = [Int32: [Int32]]()
     for target in 0..<targets {
-      connections[Int32(target)] = await sources(of: target, as: controller)
+      connections[Int32(target)] = await sources(for: target, as: controller)
     }
     return connections
   }
@@ -96,7 +96,7 @@ extension SwiftOCADevice.OcaMatrix: EmberPlusOcaMatrixRepresentable {
     var connections = [Int32: [Int32]]()
     for change in changes {
       let target = Int(change.target)
-      let wanted = await Set(change.applied(to: sources(of: target, as: controller)))
+      let wanted = await Set(change.applied(to: sources(for: target, as: controller)))
       for source in 0..<members.nY {
         guard let crosspoint = members[target, source] else { continue }
         let connect = wanted.contains(Int32(source))
@@ -104,13 +104,13 @@ extension SwiftOCADevice.OcaMatrix: EmberPlusOcaMatrixRepresentable {
         let status = await setCrosspoint(crosspoint, connect, as: controller)
         if status != .ok { refusal = status }
       }
-      connections[change.target] = await sources(of: target, as: controller)
+      connections[change.target] = await sources(for: target, as: controller)
     }
     if let refusal { throw Ocp1Error.status(refusal) }
     return connections
   }
 
-  private func sources(of target: Int, as controller: any OcaController) async -> [Int32] {
+  private func sources(for target: Int, as controller: any OcaController) async -> [Int32] {
     var sources = [Int32]()
     for source in 0..<members.nY {
       if let crosspoint = members[target, source], await isConnected(crosspoint, as: controller) {

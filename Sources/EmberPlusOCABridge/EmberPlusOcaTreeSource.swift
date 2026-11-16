@@ -226,7 +226,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     let matrices = presenter.emberPlusMatrices
     var rest = arcs[...]
     let matrix: EmberPlusOcaMatrix
-    if let numbered = matrices.first(where: { $0.number == arcs[0] && Self.isMatrixNumber(arcs[0]) }) {
+    if Self.isMatrixNumber(arcs[0]), let numbered = matrices.first(where: { $0.number == arcs[0] }) {
       matrix = numbered
       rest = rest.dropFirst()
       if rest.isEmpty { return .matrix(presenter, matrix) }
@@ -507,7 +507,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       let members = await members(of: object)
       let identifiers = identifiers(of: members, beside: presentation)
       if let presenter = object as? Presenter {
-        children += await matrices(of: presenter, at: path, session: session.id)
+        children += await matrices(for: presenter, at: path, session: session.id)
       }
       for (number, member) in members {
         let identifier = identifiers[number]!
@@ -516,7 +516,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
         {
           children.append(.matrix(GlowMatrix(.path(path + [number]), contents: matrixContents(
             own,
-            of: presenter,
+            for: presenter,
             at: path + [number],
             identifier: identifier,
             signals: presenter.emberPlusSignals(for: own)
@@ -546,7 +546,9 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     case let .matrix(presenter, matrix):
       let identifier = matrixIdentifier(matrix, objectIdentifier: "")
       var elements = [
-        await self.matrix(matrix, of: presenter, at: path, identifier: identifier, for: session.id),
+        await self.matrix(
+          matrix, for: presenter, at: path, identifier: identifier, session: session.id
+        ),
       ]
       if matrix.labels != nil {
         elements.append(labelNode(at: path + [Self.labelsNumber], identifier: "labels"))
@@ -558,12 +560,12 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
         labelNode(at: path + [LabelSide.sources.rawValue], identifier: "sources"),
       ]
     case let .labelNode(presenter, matrix, side):
-      let key = await listen(to: matrix, of: presenter, session: session.id)
+      let key = await listen(to: matrix, for: presenter, session: session.id)
       sessions[session.id]?.labelNodes[path] = (key, side)
-      let labels = labels(side, of: matrix, of: presenter, at: path)
+      let labels = labels(side, in: matrix, for: presenter, at: path)
       return labels.isEmpty ? [.node(GlowNode(.path(path)))] : labels
     case let .label(presenter, matrix, side, _):
-      return labels(side, of: matrix, of: presenter, at: Array(path.dropLast()))
+      return labels(side, in: matrix, for: presenter, at: Array(path.dropLast()))
         .filter { $0.address == .path(path) }
     case nil:
       return []
@@ -575,7 +577,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     let resolved = await resolve(path)
     // a label is read only, and is answered as it is
     if case let .label(presenter, matrix, side, _)? = resolved {
-      return labels(side, of: matrix, of: presenter, at: Array(path.dropLast()))
+      return labels(side, in: matrix, for: presenter, at: Array(path.dropLast()))
         .filter { $0.address == .path(path) }
     }
     guard case let .parameter(object, parameter)? = resolved else { return [] }
@@ -683,7 +685,8 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
     }
     sessions[session.id]?.matrices = state.matrices.filter { !$0.key.starts(with: path) }
     sessions[session.id]?.labelNodes = state.labelNodes.filter { !$0.key.starts(with: path) }
-    sessions[session.id]?.toldConnections = state.toldConnections.filter { !$0.key.starts(with: path) }
+    sessions[session.id]?.toldConnections = state.toldConnections
+      .filter { !$0.key.starts(with: path) }
     // what the session no longer hears of in any way, the device stops sending it
     guard let remaining = sessions[session.id] else { return }
     for objectNumber in remaining.hearing where !remaining.hears(objectNumber) {
@@ -714,7 +717,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
 
   private func matrixContents(
     _ matrix: EmberPlusOcaMatrix,
-    of presenter: Presenter,
+    for presenter: Presenter,
     at path: GlowPath,
     identifier: String,
     signals: EmberPlusOcaSignals
@@ -735,21 +738,21 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// An object's matrices, as its directory lists them: its own in full, the others by
   /// their contents.
   private func matrices(
-    of presenter: Presenter,
+    for presenter: Presenter,
     at path: GlowPath,
     session id: UInt64
   ) async -> [GlowElement] {
     var elements = [GlowElement]()
     for matrix in presenter.emberPlusMatrices {
       guard let number = matrix.number else {
-        let identifier = await matrixIdentifier(matrix, objectIdentifier: identifier(of: presenter, at: path)
-        )
+        let objectIdentifier = await identifier(of: presenter, at: path)
+        let identifier = matrixIdentifier(matrix, objectIdentifier: objectIdentifier)
         await elements.append(self.matrix(
           matrix,
-          of: presenter,
+          for: presenter,
           at: path,
           identifier: identifier,
-          for: id
+          session: id
         ))
         if matrix.labels != nil {
           elements.append(labelNode(at: path + [Self.labelsNumber], identifier: "labels"))
@@ -765,7 +768,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       }
       elements.append(.matrix(GlowMatrix(.path(path + [number]), contents: matrixContents(
         matrix,
-        of: presenter,
+        for: presenter,
         at: path + [number],
         identifier: matrixIdentifier(matrix, objectIdentifier: ""),
         signals: presenter.emberPlusSignals(for: matrix)
@@ -777,7 +780,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// Has the session hear of the objects whose changes may change the matrix.
   private func listen(
     to matrix: EmberPlusOcaMatrix,
-    of presenter: Presenter,
+    for presenter: Presenter,
     session id: UInt64
   ) async -> MatrixKey {
     let emitters = presenter.emberPlusEmitters(for: matrix)
@@ -818,13 +821,13 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// the session hear of its changes from then on.
   private func matrix(
     _ matrix: EmberPlusOcaMatrix,
-    of presenter: Presenter,
+    for presenter: Presenter,
     at path: GlowPath,
     identifier: String,
-    for id: UInt64
+    session id: UInt64
   ) async -> GlowElement {
     guard let state = sessions[id] else { return .matrix(GlowMatrix(.path(path))) }
-    let key = await listen(to: matrix, of: presenter, session: id)
+    let key = await listen(to: matrix, for: presenter, session: id)
     sessions[id]?.matrices[path] = key
     let signals = presenter.emberPlusSignals(for: matrix)
     let current = await presenter.emberPlusConnections(for: matrix, controller: state.controller)
@@ -839,7 +842,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       .path(path),
       contents: matrixContents(
         matrix,
-        of: presenter,
+        for: presenter,
         at: path,
         identifier: identifier,
         signals: signals
@@ -861,8 +864,8 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// A label node's parameters: one string per signal, numbered by the signal's number.
   private func labels(
     _ side: LabelSide,
-    of matrix: EmberPlusOcaMatrix,
-    of presenter: Presenter,
+    in matrix: EmberPlusOcaMatrix,
+    for presenter: Presenter,
     at path: GlowPath
   ) -> [GlowElement] {
     let signals = presenter.emberPlusSignals(for: matrix)
@@ -938,7 +941,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// otherwise, as tallies.
   private func tally(
     _ matrix: EmberPlusOcaMatrix,
-    of presenter: Presenter,
+    for presenter: Presenter,
     at path: GlowPath,
     session id: UInt64
   ) async {
@@ -962,27 +965,26 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// session has.
   private func resendSignals(
     _ matrix: EmberPlusOcaMatrix,
-    of presenter: Presenter,
+    for presenter: Presenter,
     at path: GlowPath,
     session id: UInt64
   ) async {
     guard let state = sessions[id] else { return }
     let identifier = await matrix.number == nil
-      ? matrixIdentifier(matrix, objectIdentifier: identifier(of: presenter, at: path)
-      )
+      ? matrixIdentifier(matrix, objectIdentifier: identifier(of: presenter, at: path))
       : matrixIdentifier(matrix, objectIdentifier: "")
     var elements = await [self.matrix(
       matrix,
-      of: presenter,
+      for: presenter,
       at: path,
       identifier: identifier,
-      for: id
+      session: id
     )]
     for (labelPath, label) in state.labelNodes
       where label.matrix.objectNumber == presenter.objectNumber && label.matrix.number == matrix
       .number
     {
-      elements += labels(label.side, of: matrix, of: presenter, at: labelPath)
+      elements += labels(label.side, in: matrix, for: presenter, at: labelPath)
     }
     state.session.send(.elements(elements))
   }
@@ -991,7 +993,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   /// listen to it.
   private func matrixChanged(
     _ property: OcaPropertyID,
-    of objectNumber: OcaONo,
+    for objectNumber: OcaONo,
     session id: UInt64
   ) async {
     guard let state = sessions[id] else { return }
@@ -1000,11 +1002,11 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       guard let (presenter, matrix) = await matrix(for: key) else { continue }
       if presenter.emberPlusSignalProperties.contains(property) {
         resent.insert(path)
-        await resendSignals(matrix, of: presenter, at: path, session: id)
+        await resendSignals(matrix, for: presenter, at: path, session: id)
       } else if presenter.emberPlusConnectionProperties.contains(property),
                 sessions[id]?.connecting.contains(path) != true
       {
-        await tally(matrix, of: presenter, at: path, session: id)
+        await tally(matrix, for: presenter, at: path, session: id)
       }
     }
     // label nodes of a matrix the session has not the directory of
@@ -1013,7 +1015,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
       guard let (presenter, matrix) = await matrix(for: label.matrix),
             presenter.emberPlusSignalProperties.contains(property),
             !resent.contains(where: { path.starts(with: $0) }) else { continue }
-      labels += self.labels(label.side, of: matrix, of: presenter, at: path)
+      labels += self.labels(label.side, in: matrix, for: presenter, at: path)
     }
     if !labels.isEmpty {
       state.session.send(.elements(labels))
@@ -1026,7 +1028,7 @@ public final class EmberPlusOcaTreeSource: EmberPlusTreeSource {
   private func changed(_ property: OcaPropertyID, of objectNumber: OcaONo, session id: UInt64) async {
     guard let state = sessions[id], let object = await device.objects[objectNumber] else { return }
 
-    await matrixChanged(property, of: objectNumber, session: id)
+    await matrixChanged(property, for: objectNumber, session: id)
 
     guard let path = state.subscribed[objectNumber] else { return }
 

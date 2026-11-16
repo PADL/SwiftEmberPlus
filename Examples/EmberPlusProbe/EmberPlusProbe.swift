@@ -150,7 +150,7 @@ struct Probe {
     var path = GlowPath()
     for identifier in text.split(separator: "/") {
       let children = try await consumer.getDirectory(path)
-      guard let child = children.first(where: { Self.identifier(of: $0) == String(identifier) }),
+      guard let child = children.first(where: { Self.identifier(for: $0) == String(identifier) }),
             case let .path(childPath)? = child.address
       else {
         throw ProbeError(description: "no \(identifier) under \(Self.dotted(path))")
@@ -160,7 +160,7 @@ struct Probe {
     return path
   }
 
-  static func identifier(of element: GlowElement) -> String? {
+  static func identifier(for element: GlowElement) -> String? {
     switch element {
     case let .node(node): node.contents?.identifier
     case let .parameter(parameter): parameter.contents?.identifier
@@ -182,7 +182,7 @@ struct Probe {
   }
 
   static func describe(_ element: GlowElement, at path: GlowPath) -> String {
-    let name = "\(dotted(path)) \(identifier(of: element) ?? "")"
+    let name = "\(dotted(path)) \(identifier(for: element) ?? "")"
     switch element {
     case .node:
       return "\(name)/"
@@ -269,13 +269,17 @@ struct Probe {
       matrix: matrix.path
     )
     for answer in answers {
-      print(
-        "\(matrix.targetName(answer.target)): \(Self.name(of: answer.disposition)) \(matrix.sourceNames(answer.sources))"
-      )
+      print(Self.describe(answer, in: matrix))
     }
   }
 
-  static func name(of disposition: GlowConnectionDisposition?) -> String {
+  /// A target's connection: its label, disposition and sources.
+  static func describe(_ connection: GlowConnection, in matrix: Matrix) -> String {
+    let disposition = name(for: connection.disposition)
+    return "\(matrix.targetName(connection.target)): \(disposition) \(matrix.sourceNames(connection.sources))"
+  }
+
+  static func name(for disposition: GlowConnectionDisposition?) -> String {
     switch disposition ?? .tally {
     case .tally: "tally"
     case .modified: "modified"
@@ -295,18 +299,12 @@ struct Probe {
       for element in elements {
         guard case let .path(path)? = element.address else { continue }
         if case let .matrix(changed) = element, path == matrix.path {
-          if changed
-            .contents !=
-            nil
-          {
-            print(
-              "signals changed: \(changed.targets?.count ?? 0) targets, \(changed.sources?.count ?? 0) sources"
-            )
+          if changed.contents != nil {
+            let (targets, sources) = (changed.targets?.count ?? 0, changed.sources?.count ?? 0)
+            print("signals changed: \(targets) targets, \(sources) sources")
           }
           for connection in changed.connections ?? [] {
-            print(
-              "\(matrix.targetName(connection.target)): \(Self.name(of: connection.disposition)) \(matrix.sourceNames(connection.sources))"
-            )
+            print(Self.describe(connection, in: matrix))
           }
         } else {
           print(Self.describe(element, at: path))
