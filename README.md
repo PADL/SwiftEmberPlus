@@ -28,8 +28,17 @@ presents a [SwiftOCA](https://github.com/PADL/SwiftOCA) device through it.
 - Asking for a node's directory subscribes the session to its object's property changes,
   as Ember+ has it. A sensor's reading is a stream: a consumer subscribes to it, and its
   changes come in stream collections.
-- A matrix of boolean actuators is a crosspoint matrix: the actuator at (x, y) connects
-  source y to target x.
+- An object that conforms to `EmberPlusOcaMatrixRepresentable` presents crosspoint
+  matrices: under its node (numbered 1 to 255), or as its node. It gives each matrix's
+  type and addressing, its targets and sources with their signal numbers and labels, each
+  target's sources, and the properties whose changes mean the connections or the signals
+  changed. A consumer's connection request is applied as one call, as the session's
+  controller, and answered `modified`, or `locked` with the sources as they now are if the
+  object refused it; later changes are tallies of the targets that changed, and a change
+  of signals sends the matrix again. Labels are a node under the matrix (Ember+ 1.1:
+  `targets` 1, `sources` 2, a string parameter per signal).
+- A matrix of boolean actuators conforms: the actuator at (x, y) connects source y to
+  target x.
 - The provider is advertised over DNS-SD as `_ember._tcp`, named for the device.
 
 ## Example
